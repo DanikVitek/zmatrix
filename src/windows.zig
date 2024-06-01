@@ -154,7 +154,7 @@ const Win32Error = b: {
     break :b @Type(.{ .ErrorSet = error_set });
 };
 
-fn encodeUtf16Z(comptime utf8: []const u8) *const [countCodepoints(utf8):0]u16 {
+fn encodeUtf16Z(comptime utf8: []const u8) [*:0]const u16 {
     comptime {
         var utf8_iter = std.unicode.Utf8View.initComptime(utf8).iterator();
 
@@ -190,14 +190,4 @@ fn encodeUtf16Z(comptime utf8: []const u8) *const [countCodepoints(utf8):0]u16 {
         utf16 = utf16 ++ .{0};
         return utf16[0 .. utf16.len - 1 :0];
     }
-}
-
-fn countCodepoints(comptime utf8: []const u8) comptime_int {
-    var utf8_iter = std.unicode.Utf8View.initComptime(utf8).iterator();
-
-    var count = 0;
-    while (utf8_iter.nextCodepoint()) |_| {
-        count += 1;
-    }
-    return count;
 }

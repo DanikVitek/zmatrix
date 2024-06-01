@@ -6,6 +6,9 @@ const clear = @"ansi-term".clear;
 const cursor = @"ansi-term".cursor;
 const format = @"ansi-term".format;
 const style = @"ansi-term".style;
+const terminal = @"ansi-term".terminal;
+
+// const event = @import("event.zig");
 
 const BufWriter = @TypeOf(std.io.bufferedWriter(std.io.getStdOut().writer()));
 
@@ -19,6 +22,7 @@ pub fn main() !void {
     const rng = prng.random();
 
     try cursor.hideCursor(buf_stdout.writer());
+    // try terminal.enterAlternateScreen(buf_stdout.writer());
 
     var rain = try Rain.init(
         alloc,
@@ -26,13 +30,12 @@ pub fn main() !void {
         .{ .r = 0, .g = 255, .b = 0 },
         .{ .at_least = 3, .at_most = 10 },
         .{ .at_least = 1, .at_most = 3 },
-        15,
-        100 * std.time.ns_per_ms,
+        100,
+        50 * std.time.ns_per_ms,
     );
     try rain.draw(&buf_stdout);
 
-    try clear.clearScreen(buf_stdout.writer());
-    try format.resetStyle(buf_stdout.writer());
+    // try terminal.leaveAlternateScreen(buf_stdout.writer());
     try cursor.showCursor(buf_stdout.writer());
     try buf_stdout.flush();
 }
@@ -71,19 +74,8 @@ const Rain = struct {
         drops_amount: u16,
         frame_delay_ns: u64,
     ) !Rain {
-        var raindrops = try std.ArrayList(Raindrop).initCapacity(alloc, drops_amount);
-        for (0..drops_amount) |_| {
-            const len = drop_len_range.genInt(rng);
-            raindrops.appendAssumeCapacity(Raindrop{
-                .len = len,
-                .x = rng.intRangeLessThan(u16, 0, try termWidth()),
-                .y = 0,
-                .color = color,
-                .speed = drop_speed_range.genInt(rng),
-            });
-        }
-        return Rain{
-            .drops = raindrops,
+        var rain = Rain{
+            .drops = try std.ArrayList(Raindrop).initCapacity(alloc, drops_amount),
             .rng = rng,
             .color = color,
             .drop_len_range = drop_len_range,
@@ -91,6 +83,10 @@ const Rain = struct {
             .drops_amount = drops_amount,
             .frame_delay_ns = frame_delay_ns,
         };
+        for (0..drops_amount) |_| {
+            rain.drops.appendAssumeCapacity(try rain.getNewDrop());
+        }
+        return rain;
     }
 
     fn draw(self: *Rain, buf_writer: *BufWriter) !void {
@@ -100,6 +96,7 @@ const Rain = struct {
         try cursor.setCursor(writer, 0, 0);
 
         while (true) {
+            try terminal.beginSynchronizedUpdate(writer);
             for (0..self.drops.items.len) |i| {
                 const drop = &self.drops.items[i];
 
@@ -108,23 +105,23 @@ const Rain = struct {
                 try drop.clearTail(writer);
 
                 if (try drop.isPastEnd()) {
-                    _ = self.drops.swapRemove(i);
-                    try self.addNewDrop();
+                    drop.* = try self.getNewDrop();
                 }
             }
+            try terminal.endSynchronizedUpdate(writer);
             try buf_writer.flush();
             std.time.sleep(self.frame_delay_ns);
         }
     }
 
-    fn addNewDrop(self: *Rain) !void {
-        try self.drops.append(Raindrop{
+    fn getNewDrop(self: *const Rain) !Raindrop {
+        return Raindrop{
             .len = self.drop_len_range.genInt(self.rng),
             .x = self.rng.intRangeLessThan(u16, 0, try termWidth()),
             .y = 0,
             .color = self.color,
             .speed = self.drop_speed_range.genInt(self.rng),
-        });
+        };
     }
 };
 

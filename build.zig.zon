@@ -45,7 +45,7 @@
         //},
         .ansiterm = .{
             .url = "https://github.com/DanikVitek/ansi-term/archive/master.tar.gz",
-            .hash = "1220c650d57ceb323d3e74945189aaae7a9c0ac74afd023cba5533fb7d5874b2955c",
+            .hash = "12203f9dab2d98ae4cb5e57c683af5d4c955e6c7d60e19e92e6b48a51ae725ff3a94",
         },
     },
 

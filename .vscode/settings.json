@@ -2,8 +2,10 @@
     "cSpell.words": [
         "callconv",
         "CONIN",
+        "CONOUT",
         "csbi",
         "DWORD",
+        "prng",
         "WINAPI"
     ]
 }
