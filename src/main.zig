@@ -13,34 +13,57 @@ const terminal = @"ansi-term".terminal;
 const BufWriter = @TypeOf(std.io.bufferedWriter(std.io.getStdOut().writer()));
 
 pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+
     const alloc = arena.allocator();
 
-    var buf_stdout = std.io.bufferedWriter(std.io.getStdOut().writer());
-
-    var prng = std.rand.DefaultPrng.init(0);
+    var prng = std.Random.DefaultPrng.init(0);
     const rng = prng.random();
 
-    try cursor.hideCursor(buf_stdout.writer());
-    // try terminal.enterAlternateScreen(buf_stdout.writer());
+    const raw_stdout = std.io.getStdOut();
+    defer raw_stdout.close();
 
-    var rain = try Rain.init(
+    var buf_stdout = std.io.bufferedWriter(raw_stdout.writer());
+    defer buf_stdout.flush() catch |e| std.debug.panic("{!}", .{e});
+
+    const raw_stdin = std.io.getStdIn();
+    defer raw_stdin.close();
+
+    const stdin = raw_stdin.reader();
+
+    try enableRawMode(raw_stdin);
+    defer disableRawMode(raw_stdin) catch |e| std.debug.panic("{!}", .{e});
+
+    try cursor.hideCursor(buf_stdout.writer());
+    defer cursor.showCursor(buf_stdout.writer()) catch |e| std.debug.panic("{!}", .{e});
+
+    try cursor.saveCursor(buf_stdout.writer());
+    defer cursor.restoreCursor(buf_stdout.writer()) catch |e| std.debug.panic("{!}", .{e});
+
+    try terminal.saveScreen(buf_stdout.writer());
+    defer terminal.restoreScreen(buf_stdout.writer()) catch |e| std.debug.panic("{!}", .{e});
+
+    try terminal.enterAlternateScreen(buf_stdout.writer());
+    defer terminal.leaveAlternateScreen(buf_stdout.writer()) catch |e| std.debug.panic("{!}", .{e});
+
+    var rain: Rain = try .init(
         alloc,
         rng,
         .{ .r = 0, .g = 255, .b = 0 },
         .{ .at_least = 3, .at_most = 10 },
         .{ .at_least = 1, .at_most = 3 },
-        100,
-        50 * std.time.ns_per_ms,
+        50,
+        100 * std.time.ns_per_ms,
+        buf_stdout,
     );
-    try rain.draw(&buf_stdout);
-
-    // try terminal.leaveAlternateScreen(buf_stdout.writer());
-    try cursor.showCursor(buf_stdout.writer());
-    try buf_stdout.flush();
+    try rain.run(stdin);
 }
 
 fn Range(comptime T: type) type {
+    if (@typeInfo(T) != .int) {
+        @compileError("requires integer type for Range.genInt()");
+    }
     return struct {
         at_least: T,
         at_most: T,
@@ -48,9 +71,6 @@ fn Range(comptime T: type) type {
         const Self = @This();
 
         pub fn genInt(self: *const Self, rng: std.Random) T {
-            if (@typeInfo(T) != .Int) {
-                @compileError("requires integer type for Range.genInt()");
-            }
             return rng.intRangeAtMost(T, self.at_least, self.at_most);
         }
     };
@@ -61,9 +81,11 @@ const Rain = struct {
     drop_len_range: Range(u8),
     drop_speed_range: Range(u16),
     drops_amount: u16,
-    drops: std.ArrayList(Raindrop),
+    frame_duration_ns: u64,
+    drops: std.AutoHashMapUnmanaged(u16, std.ArrayListUnmanaged(Raindrop)),
+    alloc: std.mem.Allocator,
     rng: std.Random,
-    frame_delay_ns: u64,
+    buf_writer: std.io.BufferedWriter(4096, std.fs.File.Writer),
 
     fn init(
         alloc: std.mem.Allocator,
@@ -72,52 +94,119 @@ const Rain = struct {
         drop_len_range: Range(u8),
         drop_speed_range: Range(u16),
         drops_amount: u16,
-        frame_delay_ns: u64,
+        frame_duration_ns: u64,
+        buf_writer: std.io.BufferedWriter(4096, std.fs.File.Writer),
     ) !Rain {
         var rain = Rain{
-            .drops = try std.ArrayList(Raindrop).initCapacity(alloc, drops_amount),
+            .alloc = alloc,
+            .drops = .{},
             .rng = rng,
             .color = color,
             .drop_len_range = drop_len_range,
             .drop_speed_range = drop_speed_range,
             .drops_amount = drops_amount,
-            .frame_delay_ns = frame_delay_ns,
+            .frame_duration_ns = frame_duration_ns,
+            .buf_writer = buf_writer,
         };
         for (0..drops_amount) |_| {
-            rain.drops.appendAssumeCapacity(try rain.getNewDrop());
+            const drop = try rain.getNewDrop();
+            const entry = try rain.drops.getOrPut(alloc, drop.x);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{};
+            }
+            try entry.value_ptr.append(alloc, drop);
+            std.sort.block(Raindrop, entry.value_ptr.items, {}, struct {
+                fn lessThan(_: void, lhs: Raindrop, rhs: Raindrop) bool {
+                    return lhs.compare(&rhs) == .lt;
+                }
+            }.lessThan);
         }
         return rain;
     }
 
-    fn draw(self: *Rain, buf_writer: *BufWriter) !void {
-        const writer = buf_writer.writer();
+    fn run(self: *Rain, reader: std.fs.File.Reader) !void {
+        const writer = self.buf_writer.writer();
 
         try clear.clearScreen(writer);
         try cursor.setCursor(writer, 0, 0);
 
+        var timer = try std.time.Timer.start();
         while (true) {
+            var buffer: [1]u8 = undefined;
+            const len = try reader.read(&buffer);
+            if (len == 1 and (buffer[0] == 'q' or buffer[0] == '\x1b')) {
+                break;
+            }
+
             try terminal.beginSynchronizedUpdate(writer);
-            for (0..self.drops.items.len) |i| {
-                const drop = &self.drops.items[i];
 
-                try drop.draw(writer);
-                drop.fall();
-                try drop.clearTail(writer);
+            var it = self.drops.iterator();
+            var drops_to_add: u16 = 0;
+            while (it.next()) |entry| {
+                var removed: u16 = 0;
+                for (0..entry.value_ptr.items.len) |i| {
+                    const drop = &entry.value_ptr.items[i - removed];
 
-                if (try drop.isPastEnd()) {
-                    drop.* = try self.getNewDrop();
+                    const HeightGetter = struct {
+                        file: std.fs.File,
+                        inline fn height(this: @This()) !u16 {
+                            return termHeight(this.file);
+                        }
+                    };
+                    const height_getter = HeightGetter{ .file = self.buf_writer.unbuffered_writer.context };
+
+                    try drop.draw(writer, height_getter);
+                    drop.fall();
+                    try drop.clearTail(writer);
+                    // try self.clearTail(writer, entry.key_ptr.*, i);
+
+                    if (try drop.isPastEnd(height_getter)) {
+                        _ = entry.value_ptr.orderedRemove(i - removed);
+                        removed += 1;
+                    }
                 }
+                drops_to_add += removed;
             }
             try terminal.endSynchronizedUpdate(writer);
-            try buf_writer.flush();
-            std.time.sleep(self.frame_delay_ns);
+            try self.buf_writer.flush();
+
+            for (0..drops_to_add) |_| {
+                const drop = try self.getNewDrop();
+                const entry = try self.drops.getOrPut(self.alloc, drop.x);
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = .{};
+                }
+                try entry.value_ptr.append(self.alloc, drop);
+                std.sort.block(Raindrop, entry.value_ptr.items, {}, struct {
+                    fn lessThan(_: void, lhs: Raindrop, rhs: Raindrop) bool {
+                        return lhs.compare(&rhs) == .lt;
+                    }
+                }.lessThan);
+            }
+
+            std.time.sleep(self.frame_duration_ns -| timer.lap());
         }
     }
+
+    // fn clearTail(self: *const Rain, writer: anytype, x: u16, i: usize) !void {
+    //     const drops_at_x = self.drops.getPtr(x).?;
+    //     const drop = drops_at_x.items[i];
+    //     for (0..i) |j| {
+    //         const other_drop = drops_at_x.items[j];
+    //         if (drop.compare(&other_drop) == .eq) continue;
+    //         for (0..other_drop.len) |k| {
+    //             if (other_drop.y + k - other_drop.len <= 0) {
+    //                 try cursor.setCursor(writer, x, other_drop.y + k);
+    //                 try writer.writeByte(' ');
+    //             }
+    //         }
+    //     }
+    // }
 
     fn getNewDrop(self: *const Rain) !Raindrop {
         return Raindrop{
             .len = self.drop_len_range.genInt(self.rng),
-            .x = self.rng.intRangeLessThan(u16, 0, try termWidth()),
+            .x = self.rng.intRangeLessThan(u16, 0, try termWidth(self.buf_writer.unbuffered_writer.context)),
             .y = 0,
             .color = self.color,
             .speed = self.drop_speed_range.genInt(self.rng),
@@ -133,7 +222,7 @@ const Raindrop = struct {
     len: u8,
     color: style.ColorRGB,
 
-    fn draw(self: *const Raindrop, writer: anytype) !void {
+    fn draw(self: *const Raindrop, writer: anytype, height_getter: anytype) !void {
         var r: f32 = 0;
         var g: f32 = 0;
         var b: f32 = 0;
@@ -153,7 +242,7 @@ const Raindrop = struct {
             // std.debug.print("[{*}]  y: {d}; i: {d}; len: {d}; speed: {d}\n", .{ self, self.y, i, self.len, self.speed });
 
             // y_i < 1 or y_i > termHeight() -> out of screen
-            if (self.y + i < self.len or self.y + i + 1 - self.len > try termHeight()) continue; // skip if out of screen
+            if (self.y + i < self.len or self.y + i + 1 - self.len > try height_getter.height()) continue; // skip if out of screen
             const y_i = self.y + i + 1 - self.len;
 
             // std.debug.print("y_i: {d}\n", .{y_i});
@@ -191,8 +280,14 @@ const Raindrop = struct {
         return @intCast((hasher.final() % 93) + 33); // TODO: use unicode graphemes
     }
 
-    fn isPastEnd(self: *const Raindrop) !bool {
-        return self.y + 2 > self.len + try termHeight();
+    fn isPastEnd(self: *const Raindrop, height_getter: anytype) !bool {
+        return self.y + 2 > self.len + try height_getter.height();
+    }
+
+    fn compare(self: *const Raindrop, other: *const Raindrop) std.math.Order {
+        if (self.y + other.len < other.y + self.len) return .lt;
+        if (self.y + other.len > other.y + self.len) return .gt;
+        return .eq;
     }
 };
 
@@ -204,30 +299,34 @@ fn updateColor(writer: anytype, new: style.ColorRGB, old: ?style.ColorRGB) !void
     );
 }
 
-inline fn termWidth() !u16 {
+inline fn termWidth(file: std.fs.File) !u16 {
     return switch (builtin.os.tag) {
-        .windows => @import("windows.zig").termWidth(),
+        .windows => try @import("windows.zig").termWidth(),
+        .linux => (try @import("posix.zig").termSize(file)).width,
         else => @compileError("Unsupported OS"),
     };
 }
 
-inline fn termHeight() !u16 {
+inline fn termHeight(file: std.fs.File) !u16 {
     return switch (builtin.os.tag) {
-        .windows => @import("windows.zig").termHeight(),
+        .windows => try @import("windows.zig").termHeight(),
+        .linux => (try @import("posix.zig").termSize(file)).height,
         else => @compileError("Unsupported OS"),
     };
 }
 
-inline fn enableRawMode() !void {
+inline fn enableRawMode(file: std.fs.File) !void {
     switch (builtin.os.tag) {
-        .windows => @import("windows.zig").enableRawMode(),
+        .windows => try @import("windows.zig").enableRawMode(),
+        .linux => try @import("posix.zig").enableRawMode(file),
         else => @compileError("Unsupported OS"),
     }
 }
 
-inline fn disableRawMode() !void {
+inline fn disableRawMode(file: std.fs.File) !void {
     switch (builtin.os.tag) {
-        .windows => @import("windows.zig").disableRawMode(),
+        .windows => try @import("windows.zig").disableRawMode(),
+        .linux => try @import("posix.zig").disableRawMode(file),
         else => @compileError("Unsupported OS"),
     }
 }

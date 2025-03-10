@@ -25,9 +25,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .single_threaded = true,
     });
 
-    exe.root_module.addImport("ansi-term", ansiterm.module("ansi-term"));
+    exe.root_module.addImport("ansi-term", ansiterm.module("ansi_term"));
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
